@@ -228,7 +228,9 @@ public class LinkedInController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error fetching live messages from LinkedIn");
-            return StatusCode(StatusCodes.Status500InternalServerError, ApiResponse<object>.Fail("FETCH_LIVE_MESSAGES_FAILED", ex.Message));
+            var errorResponse = ApiResponse<object>.Fail("FETCH_LIVE_MESSAGES_FAILED", ex.Message);
+            errorResponse.Error!.Details = ex.InnerException?.Message ?? ex.StackTrace;
+            return StatusCode(StatusCodes.Status500InternalServerError, errorResponse);
         }
     }
 }

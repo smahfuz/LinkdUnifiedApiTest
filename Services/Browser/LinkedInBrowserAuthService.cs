@@ -182,11 +182,29 @@ public class LinkedInBrowserAuthService : ILinkedInBrowserAuthService
                 // 1. Success condition: li_at cookie obtained
                 if (!string.IsNullOrEmpty(liAt))
                 {
-                    _logger.LogInformation("LinkedIn session cookie (li_at) captured successfully for {Username}", username);
+                    _logger.LogInformation("LinkedIn session cookie (li_at) captured successfully for {Username}. Settling feed session...", username);
+                    try
+                    {
+                        await page.GoToAsync("https://www.linkedin.com/feed/", new NavigationOptions
+                        {
+                            WaitUntil = new[] { WaitUntilNavigation.DOMContentLoaded },
+                            Timeout = 15000
+                        });
+                        await Task.Delay(1500, cancellationToken);
+                        cookies = await page.GetCookiesAsync();
+                        var finalJsession = cookies.FirstOrDefault(c => string.Equals(c.Name, "JSESSIONID", StringComparison.OrdinalIgnoreCase))?.Value;
+                        if (!string.IsNullOrEmpty(finalJsession))
+                        {
+                            jsessionId = finalJsession;
+                        }
+                    }
+                    catch { }
+
                     var connectedAccount = await FinalizeSessionFromCookiesAsync(username, liAt, jsessionId, cookies, cancellationToken);
 
-                    await page.CloseAsync();
-                    await browser.CloseAsync();
+                    // Keep browser alive for API calls (Unipile-style persistent session)
+                    await NavigateToMessagingContext(page, cancellationToken);
+                    SavePersistentBrowser(connectedAccount.AccountId, browser, page);
 
                     return new ConnectAccountResult
                     {
@@ -364,11 +382,33 @@ public class LinkedInBrowserAuthService : ILinkedInBrowserAuthService
 
                 if (!string.IsNullOrEmpty(liAt))
                 {
+                    _logger.LogInformation("Post-challenge li_at captured for {Username}. Settling feed session...", pending.Username);
+                    try
+                    {
+                        await page.GoToAsync("https://www.linkedin.com/feed/", new NavigationOptions
+                        {
+                            WaitUntil = new[] { WaitUntilNavigation.DOMContentLoaded },
+                            Timeout = 15000
+                        });
+                        await Task.Delay(2000, cancellationToken);
+                        cookies = await page.GetCookiesAsync();
+                        var finalJsession = cookies.FirstOrDefault(c => string.Equals(c.Name, "JSESSIONID", StringComparison.OrdinalIgnoreCase))?.Value;
+                        if (!string.IsNullOrEmpty(finalJsession))
+                        {
+                            jsessionId = finalJsession;
+                        }
+                    }
+                    catch (Exception settleEx)
+                    {
+                        _logger.LogWarning(settleEx, "Feed settle navigation failed, proceeding with current cookies");
+                    }
+
                     var accountResponse = await FinalizeSessionFromCookiesAsync(pending.Username, liAt, jsessionId, cookies, cancellationToken);
                     _sessionStore.RemovePendingChallenge(challengeToken);
 
-                    await page.CloseAsync();
-                    await browser.CloseAsync();
+                    // Keep browser alive for API calls (Unipile-style persistent session)
+                    await NavigateToMessagingContext(page, cancellationToken);
+                    SavePersistentBrowser(accountResponse.AccountId, browser, page);
 
                     return accountResponse;
                 }
@@ -479,6 +519,19 @@ public class LinkedInBrowserAuthService : ILinkedInBrowserAuthService
         var profileInfo = ParseProfileInfoFromJson(profileJson);
         var accountId = profileInfo.MemberUrn ?? $"acc_{Guid.NewGuid():N}";
 
+        var rawCookies = string.Join("; ", browserCookies.Select(c => $"{c.Name}={c.Value}"));
+        var cookieDtos = browserCookies.Select(c => new CookieDto
+        {
+            Name = c.Name,
+            Value = c.Value,
+            Domain = c.Domain,
+            Path = c.Path,
+            Expires = c.Expires,
+            HttpOnly = c.HttpOnly,
+            Secure = c.Secure,
+            SameSite = c.SameSite?.ToString()
+        }).ToList();
+
         var sessionState = new LinkedInSessionState
         {
             AccountId = accountId,
@@ -488,6 +541,8 @@ public class LinkedInBrowserAuthService : ILinkedInBrowserAuthService
             MemberUrn = profileInfo.MemberUrn,
             Profile = profileInfo,
             CookieContainer = cookieContainer,
+            RawCookies = rawCookies,
+            BrowserCookies = cookieDtos,
             CreatedAt = DateTime.UtcNow,
             LastUsedAt = DateTime.UtcNow,
             IsActive = true
@@ -599,4 +654,403 @@ public class LinkedInBrowserAuthService : ILinkedInBrowserAuthService
         }
         return string.Empty;
     }
+
+    /// <summary>
+    /// Navigate the persistent browser page to LinkedIn messaging context so it's ready for API calls.
+    /// </summary>
+    private async Task NavigateToMessagingContext(IPage page, CancellationToken cancellationToken, LinkedInSessionState? session = null)
+    {
+        try
+        {
+            _logger.LogInformation("Navigating persistent browser to messaging context...");
+
+            page.Response += async (sender, e) =>
+            {
+                try
+                {
+                    var u = e.Response.Url;
+                    if (u.Contains("voyager") && (u.Contains("messaging") || u.Contains("conversation") || u.Contains("graphql")))
+                    {
+                        if (e.Response.Ok)
+                        {
+                            var text = await e.Response.TextAsync();
+                            if ((text.Contains("elements") || text.Contains("conversations")) && session != null)
+                            {
+                                session.LastInterceptedConversationsJson = text;
+                                _logger.LogInformation("Intercepted LinkedIn messaging JSON from page load");
+                            }
+                        }
+                    }
+                }
+                catch { }
+            };
+
+            await page.GoToAsync("https://www.linkedin.com/messaging/", new NavigationOptions
+            {
+                WaitUntil = new[] { WaitUntilNavigation.DOMContentLoaded },
+                Timeout = 30000
+            });
+            await Task.Delay(2500, cancellationToken);
+            _logger.LogInformation("Persistent browser ready at: {Url}", page.Url);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to navigate to messaging context, browser still available");
+        }
+    }
+
+    /// <summary>
+    /// Save the browser and page to the session for persistent reuse.
+    /// </summary>
+    private void SavePersistentBrowser(string accountId, IBrowser browser, IPage page)
+    {
+        var session = _sessionStore.GetSession(accountId);
+        if (session != null)
+        {
+            if (session.PersistentBrowser is IBrowser oldBrowser && oldBrowser != browser)
+            {
+                try { oldBrowser.CloseAsync().GetAwaiter().GetResult(); } catch { }
+            }
+            session.PersistentBrowser = browser;
+            session.PersistentBrowserPage = page;
+            _logger.LogInformation("Persistent browser saved for account {AccountId}", accountId);
+        }
+    }
+
+    private async Task<string> ExecuteInPageFetch(IPage page, string url, string csrfToken)
+    {
+        return await page.EvaluateFunctionAsync<string>(@"(targetUrl, csrfToken) => {
+            return (async () => {
+                const urls = [targetUrl];
+                if (targetUrl.includes('conversations') && !targetUrl.includes('keyVersion')) {
+                    urls.push(targetUrl + (targetUrl.includes('?') ? '&' : '?') + 'keyVersion=LEGACY_INBOX');
+                }
+
+                let lastError = '';
+                for (const u of urls) {
+                    // Mode 1: Standard Voyager REST-li headers
+                    try {
+                        const r = await fetch(u, {
+                            method: 'GET',
+                            headers: {
+                                'csrf-token': csrfToken,
+                                'x-restli-protocol-version': '2.0.0',
+                                'x-li-lang': 'en_US',
+                                'Accept': 'application/vnd.linkedin.normalized+json+2.1, application/json;q=0.9, */*;q=0.8'
+                            },
+                            credentials: 'include'
+                        });
+                        const text = await r.text();
+                        if (r.ok) return text;
+                        lastError = `Mode1 HTTP ${r.status}: ${text.substring(0, 250)}`;
+                    } catch (e) {
+                        lastError = `Mode1 Error: ${e.message}`;
+                    }
+
+                    // Mode 2: Clean fetch headers without x-restli-protocol-version
+                    try {
+                        const r2 = await fetch(u, {
+                            method: 'GET',
+                            headers: {
+                                'csrf-token': csrfToken,
+                                'Accept': 'application/json, text/plain, */*'
+                            },
+                            credentials: 'include'
+                        });
+                        const text2 = await r2.text();
+                        if (r2.ok) return text2;
+                        lastError = `Mode2 HTTP ${r2.status}: ${text2.substring(0, 250)}`;
+                    } catch (e) {
+                        lastError = `Mode2 Error: ${e.message}`;
+                    }
+                }
+                throw new Error('In-page fetch failed for all modes: ' + lastError);
+            })();
+        }", url, csrfToken);
+    }
+
+    private async Task<string> ExtractConversationsFromDomAsync(IPage page)
+    {
+        try
+        {
+            await page.WaitForSelectorAsync("li.msg-conversation-listitem, .msg-conversations-container__convo-item, [data-view-name=\"msg-conversation-listitem\"], .msg-conversation-card", new WaitForSelectorOptions { Timeout = 5000 });
+        }
+        catch { }
+
+        return await page.EvaluateFunctionAsync<string>(@"() => {
+            const results = [];
+            const items = document.querySelectorAll(
+                'li.msg-conversation-listitem, .msg-conversations-container__convo-item, [data-view-name=""msg-conversation-listitem""], .msg-conversations-container__conversations-list > li'
+            );
+            for (const el of items) {
+                const link = el.querySelector('a[href*=""/messaging/thread/""]');
+                let threadId = '';
+                if (link) {
+                    const m = link.href.match(/\/messaging\/thread\/([^/?]+)/);
+                    if (m) threadId = m[1];
+                }
+                if (!threadId) {
+                    const dataId = el.getAttribute('data-id') || el.getAttribute('data-entity-urn');
+                    if (dataId) threadId = dataId;
+                    else threadId = 'conv_' + Math.random().toString(36).substring(2, 9);
+                }
+
+                const nameEl = el.querySelector(
+                    '.msg-conversation-listitem__participant-names, [class*=""participant-name""], h3, .msg-conversation-card__participant-names'
+                );
+                const name = nameEl ? nameEl.innerText.trim() : 'LinkedIn Member';
+
+                const snippetEl = el.querySelector(
+                    '.msg-conversation-card__message-snippet, [class*=""message-snippet""], [class*=""snippet""], p'
+                );
+                const snippet = snippetEl ? snippetEl.innerText.trim() : '';
+
+                const unreadEl = el.querySelector('.msg-conversation-card__unread-count, [class*=""unread""]');
+                const unreadCount = unreadEl ? parseInt(unreadEl.innerText.trim()) || 1 : 0;
+
+                results.push({
+                    id: threadId,
+                    entityUrn: threadId.startsWith('urn:') ? threadId : 'urn:li:fs_conversation:' + threadId,
+                    title: name,
+                    unreadCount: unreadCount,
+                    lastActivityAt: new Date().toISOString(),
+                    participants: [{ name: name, profileUrn: '', headline: '' }],
+                    lastMessage: {
+                        id: 'msg_' + Math.random().toString(36).substring(2, 9),
+                        text: snippet,
+                        senderName: name,
+                        sentAt: new Date().toISOString()
+                    }
+                });
+            }
+            return JSON.stringify({
+                total: results.length,
+                conversations: results
+            });
+        }");
+    }
+
+    private async Task<string> ExtractMessagesFromDomAsync(IPage page, string url)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(url, @"conversations/([^/?]+)/events");
+        var threadId = match.Success ? Uri.UnescapeDataString(match.Groups[1].Value).Replace("urn:li:fs_conversation:", "") : "";
+
+        if (!string.IsNullOrEmpty(threadId) && !page.Url.Contains(threadId, StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                await page.GoToAsync($"https://www.linkedin.com/messaging/thread/{threadId}/", new NavigationOptions
+                {
+                    WaitUntil = new[] { WaitUntilNavigation.DOMContentLoaded },
+                    Timeout = 20000
+                });
+                await Task.Delay(2000);
+            }
+            catch { }
+        }
+
+        try
+        {
+            await page.WaitForSelectorAsync(".msg-s-message-list__event, .msg-s-event-listitem, [class*=\"message-bubble\"], [class*=\"message-group\"]", new WaitForSelectorOptions { Timeout = 5000 });
+        }
+        catch { }
+
+        return await page.EvaluateFunctionAsync<string>(@"(convId) => {
+            const results = [];
+            const items = document.querySelectorAll(
+                '.msg-s-message-list__event, .msg-s-event-listitem, [class*=""message-group""], [class*=""event-listitem""], .msg-s-message-group'
+            );
+            for (const el of items) {
+                const nameEl = el.querySelector('.msg-s-message-group__name, [class*=""message-group__name""], [class*=""sender-name""]');
+                const name = nameEl ? nameEl.innerText.trim() : 'LinkedIn Member';
+
+                const bodyEl = el.querySelector('.msg-s-event-listitem__body, [class*=""message-bubble""], p');
+                const text = bodyEl ? bodyEl.innerText.trim() : '';
+
+                if (text) {
+                    results.push({
+                        id: 'msg_' + Math.random().toString(36).substring(2, 9),
+                        conversationId: convId,
+                        senderName: name,
+                        isFromMe: false,
+                        text: text,
+                        sentAt: new Date().toISOString()
+                    });
+                }
+            }
+            return JSON.stringify({
+                total: results.length,
+                messages: results
+            });
+        }", threadId);
+    }
+
+    private async Task<string> GetActiveCsrf(IPage page, string fallbackCsrf)
+    {
+        var pageCookies = await page.GetCookiesAsync();
+        var pageJsession = pageCookies.FirstOrDefault(c => string.Equals(c.Name, "JSESSIONID", StringComparison.OrdinalIgnoreCase))?.Value;
+        return !string.IsNullOrEmpty(pageJsession) ? pageJsession.Trim('"') : fallbackCsrf.Trim('"');
+    }
+
+    public async Task<string> FetchWithBrowserAsync(string url, LinkedInSessionState session, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentException.ThrowIfNullOrWhiteSpace(url);
+
+        // Check if we intercepted network response from page load
+        if (url.Contains("conversations") && !string.IsNullOrEmpty(session.LastInterceptedConversationsJson))
+        {
+            _logger.LogInformation("Returning intercepted network JSON for conversations");
+            return session.LastInterceptedConversationsJson;
+        }
+
+        // ===== STRATEGY 1: Use PERSISTENT browser page =====
+        if (session.PersistentBrowserPage is IPage existingPage && session.PersistentBrowser is IBrowser existingBrowser)
+        {
+            if (!existingBrowser.IsClosed)
+            {
+                try
+                {
+                    _logger.LogInformation("Using PERSISTENT browser for: {Url}", url);
+                    if (!existingPage.Url.Contains("linkedin.com/messaging", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await existingPage.GoToAsync("https://www.linkedin.com/messaging/", new NavigationOptions
+                        {
+                            WaitUntil = new[] { WaitUntilNavigation.DOMContentLoaded },
+                            Timeout = 30000
+                        });
+                        await Task.Delay(1500, cancellationToken);
+                    }
+
+                    // Try in-page fetch first
+                    try
+                    {
+                        var activeCsrf = await GetActiveCsrf(existingPage, session.GetCsrfToken());
+                        var jsonResult = await ExecuteInPageFetch(existingPage, url, activeCsrf);
+                        session.LastUsedAt = DateTime.UtcNow;
+                        _logger.LogInformation("Persistent browser fetch SUCCESS for {Url}", url);
+                        return jsonResult;
+                    }
+                    catch (Exception inPageEx)
+                    {
+                        _logger.LogWarning(inPageEx, "In-page fetch failed, proceeding to DOM extraction fallback");
+                    }
+
+                    // DOM extraction fallback
+                    if (url.Contains("conversations"))
+                    {
+                        var domJson = await ExtractConversationsFromDomAsync(existingPage);
+                        session.LastUsedAt = DateTime.UtcNow;
+                        _logger.LogInformation("DOM extraction SUCCESS for conversations");
+                        return domJson;
+                    }
+                    else if (url.Contains("/events"))
+                    {
+                        var domMsgs = await ExtractMessagesFromDomAsync(existingPage, url);
+                        session.LastUsedAt = DateTime.UtcNow;
+                        _logger.LogInformation("DOM extraction SUCCESS for messages");
+                        return domMsgs;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Persistent browser processing failed, launching new browser");
+                }
+            }
+            else
+            {
+                _logger.LogWarning("Persistent browser was closed unexpectedly");
+            }
+            session.PersistentBrowser = null;
+            session.PersistentBrowserPage = null;
+        }
+
+        // ===== STRATEGY 2: Launch NEW browser with saved cookies =====
+        _logger.LogInformation("Launching NEW browser for: {Url}", url);
+        await EnsureBrowserDownloadedAsync();
+        var chromePath = GetChromeExecutablePath();
+
+        var browser = await Puppeteer.LaunchAsync(new LaunchOptions
+        {
+            Headless = true,
+            ExecutablePath = chromePath,
+            Args = new[]
+            {
+                "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled", "--disable-infobars", "--window-size=1280,800"
+            }
+        });
+
+        var page = await browser.NewPageAsync();
+        await page.EvaluateFunctionOnNewDocumentAsync(@"() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = { runtime: {} };
+        }");
+        await page.SetUserAgentAsync(UserAgent);
+
+        // Set ALL cookies
+        var csrf = session.GetCsrfToken();
+        var cookiesToAdd = new List<CookieParam>
+        {
+            new CookieParam { Name = "li_at", Value = session.LiAtCookie, Domain = ".linkedin.com", Path = "/" },
+            new CookieParam { Name = "JSESSIONID", Value = $"\"{csrf}\"", Domain = ".linkedin.com", Path = "/" }
+        };
+        foreach (var c in session.BrowserCookies ?? new List<CookieDto>())
+        {
+            if (!string.Equals(c.Name, "li_at", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(c.Name, "JSESSIONID", StringComparison.OrdinalIgnoreCase))
+            {
+                cookiesToAdd.Add(new CookieParam
+                {
+                    Name = c.Name, Value = c.Value,
+                    Domain = !string.IsNullOrWhiteSpace(c.Domain) ? c.Domain : ".linkedin.com",
+                    Path = !string.IsNullOrWhiteSpace(c.Path) ? c.Path : "/"
+                });
+            }
+        }
+        await page.SetCookieAsync(cookiesToAdd.ToArray());
+
+        // Navigate to messaging context
+        await page.GoToAsync("https://www.linkedin.com/messaging/", new NavigationOptions
+        {
+            WaitUntil = new[] { WaitUntilNavigation.DOMContentLoaded },
+            Timeout = 30000
+        });
+        await Task.Delay(2000, cancellationToken);
+
+        if (page.Url.Contains("login", StringComparison.OrdinalIgnoreCase) ||
+            page.Url.Contains("checkpoint", StringComparison.OrdinalIgnoreCase))
+        {
+            await browser.CloseAsync();
+            throw new UnauthorizedAccessException($"Browser session expired (redirected to {page.Url}). Please reconnect.");
+        }
+
+        SavePersistentBrowser(session.AccountId, browser, page);
+        session.LastUsedAt = DateTime.UtcNow;
+
+        // Try in-page fetch
+        try
+        {
+            var activeCsrf2 = await GetActiveCsrf(page, csrf);
+            var result = await ExecuteInPageFetch(page, url, activeCsrf2);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "New browser in-page fetch failed, attempting DOM extraction");
+        }
+
+        // DOM extraction fallback
+        if (url.Contains("conversations"))
+        {
+            return await ExtractConversationsFromDomAsync(page);
+        }
+        else if (url.Contains("/events"))
+        {
+            return await ExtractMessagesFromDomAsync(page, url);
+        }
+
+        throw new HttpRequestException($"Could not fetch or extract data for {url}");
+    }
 }
+

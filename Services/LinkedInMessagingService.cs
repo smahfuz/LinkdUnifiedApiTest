@@ -2,12 +2,14 @@ using System.Net;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using LinkdUnified.Models;
+using LinkdUnified.Services.Browser;
 
 namespace LinkdUnified.Services;
 
 public class LinkedInMessagingService : ILinkedInMessagingService
 {
     private readonly ILinkedInSessionStore _sessionStore;
+    private readonly ILinkedInBrowserAuthService _browserAuthService;
     private readonly ILogger<LinkedInMessagingService> _logger;
 
     private const string UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
@@ -15,9 +17,13 @@ public class LinkedInMessagingService : ILinkedInMessagingService
     private const string LegacyVoyagerConversationsUrl = "https://www.linkedin.com/voyager/api/messaging/conversations?keyVersion=LEGACY_INBOX";
     private const string VoyagerBaseUrl = "https://www.linkedin.com";
 
-    public LinkedInMessagingService(ILinkedInSessionStore sessionStore, ILogger<LinkedInMessagingService> logger)
+    public LinkedInMessagingService(
+        ILinkedInSessionStore sessionStore,
+        ILinkedInBrowserAuthService browserAuthService,
+        ILogger<LinkedInMessagingService> logger)
     {
         _sessionStore = sessionStore;
+        _browserAuthService = browserAuthService;
         _logger = logger;
     }
 
@@ -48,12 +54,35 @@ public class LinkedInMessagingService : ILinkedInMessagingService
             response = await SendVoyagerRequestWithRedirectsAsync(client, LegacyVoyagerConversationsUrl, session, cancellationToken);
         }
 
-        if (!response.IsSuccessStatusCode)
+        string json;
+        if (response.IsSuccessStatusCode)
         {
-            HandleErrorResponse(response, session.AccountId);
+            json = await response.Content.ReadAsStringAsync(cancellationToken);
+        }
+        else
+        {
+            _logger.LogWarning("Voyager HTTP conversations request failed ({Status}). Falling back to browser context fetch.", response.StatusCode);
+            try
+            {
+                json = await _browserAuthService.FetchWithBrowserAsync(VoyagerConversationsUrl, session, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Browser fallback fetch for clean conversations URL failed, trying legacy URL...");
+                try
+                {
+                    json = await _browserAuthService.FetchWithBrowserAsync(LegacyVoyagerConversationsUrl, session, cancellationToken);
+                }
+                catch (Exception ex2)
+                {
+                    _logger.LogError(ex2, "Browser fallback fetch failed for both conversations URLs");
+                    var httpBody = string.Empty;
+                    try { httpBody = await response.Content.ReadAsStringAsync(cancellationToken); } catch { }
+                    throw new HttpRequestException($"LinkedIn Voyager API failed (HTTP {(int)response.StatusCode}: {response.ReasonPhrase}, Body: {httpBody.Substring(0, Math.Min(300, httpBody.Length))}). Browser fallback error: {ex2.Message}", ex2);
+                }
+            }
         }
 
-        var json = await response.Content.ReadAsStringAsync(cancellationToken);
         session.LastUsedAt = DateTime.UtcNow;
 
         return ParseConversationsFromJson(json, session);
@@ -91,12 +120,28 @@ public class LinkedInMessagingService : ILinkedInMessagingService
         _logger.LogInformation("Fetching messages for conversation {ConversationId} (Account: {AccountId})", conversationId, session.AccountId);
 
         var response = await SendVoyagerRequestWithRedirectsAsync(client, messagesUrl, session, cancellationToken);
-        if (!response.IsSuccessStatusCode)
+        
+        string json;
+        if (response.IsSuccessStatusCode)
         {
-            HandleErrorResponse(response, session.AccountId);
+            json = await response.Content.ReadAsStringAsync(cancellationToken);
+        }
+        else
+        {
+            _logger.LogWarning("Voyager HTTP messages request failed ({Status}). Falling back to browser context fetch.", response.StatusCode);
+            try
+            {
+                json = await _browserAuthService.FetchWithBrowserAsync(messagesUrl, session, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Browser fallback fetch failed for messages");
+                var httpBody = string.Empty;
+                try { httpBody = await response.Content.ReadAsStringAsync(cancellationToken); } catch { }
+                throw new HttpRequestException($"LinkedIn Voyager messages API failed (HTTP {(int)response.StatusCode}: {response.ReasonPhrase}, Body: {httpBody.Substring(0, Math.Min(300, httpBody.Length))}). Browser fallback error: {ex.Message}", ex);
+            }
         }
 
-        var json = await response.Content.ReadAsStringAsync(cancellationToken);
         session.LastUsedAt = DateTime.UtcNow;
 
         return ParseMessagesFromJson(json, conversationId, session);
@@ -218,7 +263,21 @@ public class LinkedInMessagingService : ILinkedInMessagingService
         request.Headers.Add("sec-fetch-mode", "cors");
         request.Headers.Add("sec-fetch-site", "same-origin");
         request.Headers.Referrer = new Uri("https://www.linkedin.com/messaging/");
-        request.Headers.TryAddWithoutValidation("Cookie", $"li_at={session.LiAtCookie}; JSESSIONID=\"{csrf}\";");
+        
+        var cookieHeader = !string.IsNullOrWhiteSpace(session.RawCookies)
+            ? session.RawCookies
+            : $"li_at={session.LiAtCookie}; JSESSIONID=\"{csrf}\";";
+
+        if (!cookieHeader.Contains("JSESSIONID="))
+        {
+            cookieHeader = $"JSESSIONID=\"{csrf}\"; {cookieHeader}";
+        }
+        if (!cookieHeader.Contains("li_at="))
+        {
+            cookieHeader = $"li_at={session.LiAtCookie}; {cookieHeader}";
+        }
+
+        request.Headers.TryAddWithoutValidation("Cookie", cookieHeader);
     }
 
     private void HandleErrorResponse(HttpResponseMessage response, string accountId)
@@ -245,6 +304,18 @@ public class LinkedInMessagingService : ILinkedInMessagingService
         {
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
+
+            // Direct format check (from DOM extraction or clean response)
+            if (root.TryGetProperty("conversations", out var directConvs) && directConvs.ValueKind == JsonValueKind.Array)
+            {
+                var directList = JsonSerializer.Deserialize<List<ConversationDto>>(directConvs.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                if (directList != null)
+                {
+                    response.Conversations = directList;
+                    response.Total = directList.Count;
+                    return response;
+                }
+            }
 
             // Map included profiles and messages by entityUrn
             var miniProfiles = new Dictionary<string, ParticipantDto>(StringComparer.OrdinalIgnoreCase);
@@ -403,6 +474,18 @@ public class LinkedInMessagingService : ILinkedInMessagingService
         {
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
+
+            // Direct format check (from DOM extraction or clean response)
+            if (root.TryGetProperty("messages", out var directMsgs) && directMsgs.ValueKind == JsonValueKind.Array)
+            {
+                var directList = JsonSerializer.Deserialize<List<MessageDto>>(directMsgs.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                if (directList != null)
+                {
+                    response.Messages = directList;
+                    response.Total = directList.Count;
+                    return response;
+                }
+            }
 
             var miniProfiles = new Dictionary<string, ParticipantDto>(StringComparer.OrdinalIgnoreCase);
             var messagingMembers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
