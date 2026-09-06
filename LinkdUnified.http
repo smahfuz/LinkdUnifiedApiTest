@@ -1,0 +1,42 @@
+@LinkdUnified_HostAddress = http://localhost:5044
+
+### 1. Connect LinkedIn Account (Using Session Cookie li_at)
+POST {{LinkdUnified_HostAddress}}/api/linkedin/accounts/connect
+Content-Type: application/json
+
+{
+  "sessionCookie": "AQEDAThYEe0Ez5taAAABoHGPhPIAAAGglZwI8lYAHVcbD6cmBYkVb8XCtyiJY7gPIIXib5LiDIEQBECPn-cxiYFcgDwic4sXxpALYvw9VsAu-OC5h3e17NGR3XyAUoZJKlxj96i7qPmaGYIX8miPmE7K"
+}
+
+### 2. Register a Webhook to Receive Real-Time New Message Events
+POST {{LinkdUnified_HostAddress}}/api/linkedin/webhooks/subscribe
+Content-Type: application/json
+
+{
+  "targetUrl": "https://webhook.site/your-unique-url",
+  "secret": "my-secure-secret-key"
+}
+
+### 3. List Registered Webhooks
+GET {{LinkdUnified_HostAddress}}/api/linkedin/webhooks
+Accept: application/json
+
+### 4. Instant Live View: Recent Incoming Messages from Database (Real-Time)
+GET {{LinkdUnified_HostAddress}}/api/linkedin/db/messages/recent?limit=20
+Accept: application/json
+
+### 5. Get Synced Conversations from SQL Server Database
+GET {{LinkdUnified_HostAddress}}/api/linkedin/db/conversations
+Accept: application/json
+
+### 6. Get Messages for a Conversation from SQL Server Database
+GET {{LinkdUnified_HostAddress}}/api/linkedin/db/conversations/2-MzM1OWE2NmIt.../messages
+Accept: application/json
+
+### 7. Trigger Manual Immediate Sync (Fetches live messages and pushes Webhook)
+POST {{LinkdUnified_HostAddress}}/api/linkedin/sync
+Accept: application/json
+
+### 8. View Webhook Delivery Logs
+GET {{LinkdUnified_HostAddress}}/api/linkedin/webhooks/logs
+Accept: application/json
